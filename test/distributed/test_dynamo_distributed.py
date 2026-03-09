@@ -1779,6 +1779,7 @@ class TestSingleProc(DynamoDistributedSingleProcTestCase):
             self.assertTrue(same(correct_outputs, opt_outputs))
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+    @torch._dynamo.config.patch("nested_graph_breaks", False)
     def test_graph_split_inductor_layout_optimizations_training(self):
         self._test_graph_split_inductor_layout_optimizations_impl(
             contextlib.nullcontext
@@ -2183,6 +2184,7 @@ class TestSingleProc(DynamoDistributedSingleProcTestCase):
         # the frame count would be equal to the number of forward calls)
         self.assertEqual(cnt.frame_count, 1)
 
+    @torch._dynamo.config.patch("nested_graph_breaks", False)
     def test_fsdp_staticmethod(self):
         """
         Tests that Dynamo compiles staticmethods for FSDP-managed modules
