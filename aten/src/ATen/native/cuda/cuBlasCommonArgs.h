@@ -1,6 +1,8 @@
 #pragma once
 
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
+#include <ATen/ExpandUtils.h>
 
 namespace at::native {
 
@@ -57,6 +59,20 @@ c10::MaybeOwned<Tensor> inline prepare_matrix_for_cublas(const Tensor& tensor, b
   }
 }
 
+std::optional<c10::MaybeOwned<Tensor>> inline maybe_prepare_matrix_with_layout(
+    const Tensor& t,
+    bool make_row_major_like) {
+  int64_t ld = make_row_major_like ? 0 : 1;
+  IntArrayRef strides = t.strides();
+  IntArrayRef sizes = t.sizes();
+  if (strides[1 - ld] == 1 && strides[ld] >= std::max<int64_t>(1, sizes[1 - ld])) {
+    return c10::MaybeOwned<Tensor>::borrowed(t);
+  } else {
+    // No compliance, it is best to copy bias into result
+    return std::nullopt;
+  }
+}
+
 } // namespace
 
 /**
@@ -97,6 +113,8 @@ struct cublasCommonArgs {
       const Tensor& mat1,
       const Tensor& mat2,
       Tensor& c,
+      const std::optional<Tensor>& self = std::nullopt,
+      const std::optional<Scalar>& beta = std::nullopt,
       const std::optional<Tensor>& scale_a = std::nullopt,
       const std::optional<Tensor>& scale_b = std::nullopt,
       const std::optional<Tensor>& scale_result = std::nullopt,
@@ -136,9 +154,18 @@ struct cublasCommonArgs {
     m = sizes_a[transpose_result ? 1 : 0];
     k = sizes_a[transpose_result ? 0 : 1];
     n = sizes_b[transpose_result ? 0 : 1];
-    lda = mata->stride((transpose_a == transpose_result) ? 1 : 0);
-    ldb = matb->stride((transpose_b == transpose_result) ? 1 : 0);
+
+    const auto get_ld = [](c10::MaybeOwned<Tensor>& t, bool trans_t, bool trans_res) -> int64_t {
+      // NOTE: a tensor of shape (1, 2) with strides (1, 1) is contiguous in PyTorch.
+      // However, cuBLAS expects inputs with sorted strides being strictly increasing/decreasing.
+      const auto strides = t->is_contiguous() ? c10::contiguous_strides(t->sizes()) : t->strides();
+      return strides[(trans_t == trans_res) ? 1 : 0];
+    };
+
+    lda = get_ld(mata, transpose_a, transpose_result);
+    ldb = get_ld(matb, transpose_b, transpose_result);
     result_ld = result->stride(transpose_result ? 0 : 1);
+
     transa = transpose_a ? mata->is_conj() ? 'c' : 't' : 'n';
     transb = transpose_b ? matb->is_conj() ? 'c' : 't' : 'n';
 
@@ -149,6 +176,110 @@ struct cublasCommonArgs {
       lda = lda * 2;
       ldb = ldb * 2;
     }
+
+    this->beta = beta;
+    // Prepare bias if it is different from result and beta != 0
+    if (!self.has_value() || c.is_same(*self) || is_beta_zero()) {
+      return;
+    }
+    // Required: bias.dtype == result.dtype
+    if (self->scalar_type() != c.scalar_type()) {
+      must_copy_bias = true;
+      return;
+    }
+    if (self->scalar_type() == c.scalar_type() && self->scalar_type() != mat1.scalar_type()) {
+      // NOTE: self and result are different tensors here
+      // NOTE: possible Lt dispatch with self.dtype == result.dtype == Float and
+      // mat1.dtype/mat2.dtype if of reduced float type -- we do not have
+      // such a kernel specialization yet, so need to copy bias.
+      must_copy_bias = true;
+      return;
+    }
+
+    // Whether bias broadcasts over rows/cols as per `bias + m1 @ m2` in PyTorch.
+    // NOTE: cuBLASLt assumes "transposed" broadcasting when `bias` is a vector.
+    // row broadcast: bias is viewed as a 1D memory.
+    const bool bias_row_broadcasts = (
+      (
+        // result is row-major. This implies a transposition trick
+        // which forces bias.shape[-1] == m (post transposition).
+        // shapes [1, ..., 1, m] are fine.
+        transpose_result
+        && self->dim() >= 1
+        && self->sizes().end()[-1] == m
+        && self->numel() == m
+      )
+      || (
+        // result is col-major. This implies no transposition trick
+        // which forces bias.shape[-2:] == (m, 1).
+        // shapes [1, ..., m, 1] are fine.
+        !transpose_result
+        && self->dim() >= 2
+        && self->sizes().end()[-1] == 1
+        && self->sizes().end()[-2] == m
+        && self->numel() == m
+      )
+    );
+    // col broadcast: bias can be viewed as a 2D memory with the leading dimension 0.
+    const auto non_ld_len = transpose_result ? n : m;
+    const bool bias_col_broadcasts = (
+      // shapes [1, ..., 1, non_ld_len, 1] are fine
+      self->dim() >= 2
+      && self->sizes().end()[-1] == 1
+      && self->sizes().end()[-2] == non_ld_len
+      && self->numel() == non_ld_len
+    );
+    const bool can_use_bias_in_epilogue = (
+        self->is_contiguous() // required for epilogue fusion
+        && bias_row_broadcasts // required for epilogue fusion
+        && is_beta_one() // no scaling for bias in epilogue
+        && !result->is_complex() // no Epilogue support for complex types
+    );
+    if (can_use_bias_in_epilogue) { // Case for bias in epilogue
+      bias = c10::MaybeOwned<Tensor>::borrowed(*self);
+    } else { // Case for, potentially, an out-of-place GEMM
+      if (bias_row_broadcasts && self->is_contiguous()) {
+        // Bias can be viewed as 2D with the leading dimension 0.
+        // Being contiguous is key!
+        bias = c10::MaybeOwned<Tensor>::borrowed(*self);
+        bias_ld = static_cast<int64_t>(0);
+      }
+      else if (bias_col_broadcasts) {
+        // Not yet supporeted in Lt, because:
+        // 1. Cannot set C desc layout != D desc layout.
+        // 2. Can match layout with op(C) = Z or T,
+        //    but it is not supported.
+        must_copy_bias = true;
+      } else if (self->dim() == 2) { // 2D bias
+        // DEBUG {
+        must_copy_bias = true;
+        return;
+      } else { // Fallback - copy bias into result
+        must_copy_bias = true;
+      }
+    }
+  }
+
+  void set_default_bias_vars() {
+    bias = std::nullopt;
+    bias_ld = std::nullopt;
+    must_copy_bias = false;
+  }
+
+  bool is_beta_zero() const {
+    return beta.has_value() && beta->toComplexDouble() == 0.0;
+  }
+
+  bool is_beta_one() const {
+    return !beta.has_value() || (beta.has_value() && beta->toComplexDouble() == 1.0);
+  }
+
+  bool can_use_bias_epilogue() const {
+    return bias.has_value() && !bias_ld.has_value() && is_beta_one();
+  }
+
+  bool must_copy_bias_into_result() const {
+    return must_copy_bias;
   }
 
   // Matrix members
@@ -156,6 +287,12 @@ struct cublasCommonArgs {
   int64_t m, n, k;
   int64_t lda, ldb, result_ld;
   c10::MaybeOwned<Tensor> mata, matb, result;
+
+  // Bias
+  std::optional<int64_t> bias_ld = std::nullopt;
+  std::optional<c10::MaybeOwned<Tensor>> bias = std::nullopt;
+  std::optional<Scalar> beta = std::nullopt;
+  bool must_copy_bias = false;
 
   // Scale members
   void* scale_mata_ptr = nullptr;
