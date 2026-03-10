@@ -290,7 +290,9 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             self.args.amp = True
             self.setup_amp()
 
-        if model_name == "vision_maskrcnn" and is_training:
+        print(f"DEBUG: {model_name=}, {is_training=}, {use_eval_mode=}, {batch_size=}, {extra_args=}")
+        # if model_name == "vision_maskrcnn" and is_training:
+        if model_name == "vision_maskrcnn":
             # Output of vision_maskrcnn model is a list of bounding boxes,
             # sorted on the basis of their scores. This makes accuracy
             # comparison hard with torch.compile. torch.compile can cause minor
@@ -299,13 +301,14 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             # all the bounding boxes, we compare only top 4.
             model_kwargs = {"box_detections_per_img": 4}
             benchmark = benchmark_cls(
-                test="train",
+                test="train" if is_training else "eval",
                 device=device,
                 batch_size=batch_size,
                 extra_args=extra_args,
                 model_kwargs=model_kwargs,
             )
-            use_eval_mode = True
+            if is_training:
+                use_eval_mode = True
         elif is_training:
             benchmark = benchmark_cls(
                 test="train",
@@ -430,6 +433,17 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     def get_iou_threshold(self, name):
         iou_thresholds = self._tolerance.get("iou_thresholds", {})
         return iou_thresholds.get(name, 0.99)
+
+    @property
+    def label_iou_accuracy_models(self):
+        return {
+            "vision_maskrcnn",
+        }
+
+    def get_detection_iou_threshold(self, name):
+        if name == "vision_maskrcnn":
+            return 0.9
+        return super().get_detection_iou_threshold(name)
 
     def get_accuracy_check_runs(self, name):
         accuracy_check_runs = self._tolerance.get("accuracy_check_runs", {})

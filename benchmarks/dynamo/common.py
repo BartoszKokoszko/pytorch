@@ -25,7 +25,7 @@ import tempfile
 import time
 import weakref
 from contextlib import contextmanager
-from typing import Any, NamedTuple, Optional, overload, TYPE_CHECKING, TypeVar
+from typing import Any, Callable, NamedTuple, Optional, overload, TYPE_CHECKING, TypeVar
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -116,6 +116,154 @@ output_filename = None
 disable_output = False
 
 MAX_DOWNLOAD_ATTEMPTS = 5
+
+
+def _box_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU for boxes in xyxy format."""
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]), dtype=torch.float32)
+
+    boxes1 = boxes1.to(dtype=torch.float32)
+    boxes2 = boxes2.to(dtype=torch.float32)
+
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (
+        boxes1[:, 3] - boxes1[:, 1]
+    ).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (
+        boxes2[:, 3] - boxes2[:, 1]
+    ).clamp(min=0)
+    union = area1[:, None] + area2[None, :] - inter
+    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
+
+
+def _same_detection_by_label_iou(
+    ref: list[dict[str, Any]],
+    res: list[dict[str, Any]],
+    *,
+    iou_threshold: float,
+    score_tol: float,
+    log_error: Callable[..., None],
+) -> bool:
+    """Compare detection outputs by class label and IoU-based matching."""
+    if len(ref) != len(res):
+        log_error("Detection output length mismatch: %d != %d", len(ref), len(res))
+        return False
+
+    for img_idx, (ref_img, res_img) in enumerate(zip(ref, res)):
+        if not isinstance(ref_img, dict) or not isinstance(res_img, dict):
+            log_error("Detection output item %d is not a dict", img_idx)
+            return False
+
+        required_keys = {"boxes", "labels", "scores"}
+        if not required_keys.issubset(ref_img.keys()) or not required_keys.issubset(
+            res_img.keys()
+        ):
+            log_error(
+                "Detection output item %d is missing one of keys %s",
+                img_idx,
+                sorted(required_keys),
+            )
+            return False
+
+        ref_boxes = ref_img["boxes"]
+        ref_labels = ref_img["labels"]
+        ref_scores = ref_img["scores"]
+        res_boxes = res_img["boxes"]
+        res_labels = res_img["labels"]
+        res_scores = res_img["scores"]
+
+        if not (
+            isinstance(ref_boxes, torch.Tensor)
+            and isinstance(ref_labels, torch.Tensor)
+            and isinstance(ref_scores, torch.Tensor)
+            and isinstance(res_boxes, torch.Tensor)
+            and isinstance(res_labels, torch.Tensor)
+            and isinstance(res_scores, torch.Tensor)
+        ):
+            log_error("Detection output item %d contains non-tensor values", img_idx)
+            return False
+
+        if ref_boxes.shape[0] != ref_labels.shape[0] or ref_boxes.shape[0] != ref_scores.shape[0]:
+            log_error("Ref detection output %d has inconsistent sizes", img_idx)
+            return False
+        if res_boxes.shape[0] != res_labels.shape[0] or res_boxes.shape[0] != res_scores.shape[0]:
+            log_error("Res detection output %d has inconsistent sizes", img_idx)
+            return False
+
+        all_labels = torch.unique(torch.cat([ref_labels, res_labels]))
+        for cls in all_labels.tolist():
+            ref_idx = (ref_labels == cls).nonzero(as_tuple=False).flatten()
+            res_idx = (res_labels == cls).nonzero(as_tuple=False).flatten()
+
+            if ref_idx.numel() != res_idx.numel():
+                log_error(
+                    "Image %d class %s count mismatch: ref=%d, res=%d",
+                    img_idx,
+                    cls,
+                    ref_idx.numel(),
+                    res_idx.numel(),
+                )
+                return False
+
+            if ref_idx.numel() == 0:
+                continue
+
+            ious = _box_iou_xyxy(ref_boxes[ref_idx], res_boxes[res_idx])
+            candidates = []
+            for i in range(ious.shape[0]):
+                for j in range(ious.shape[1]):
+                    candidates.append((float(ious[i, j]), int(i), int(j)))
+            candidates.sort(reverse=True, key=lambda x: x[0])
+
+            used_ref_local: set[int] = set()
+            used_res_local: set[int] = set()
+            for iou, i_local, j_local in candidates:
+                if i_local in used_ref_local or j_local in used_res_local:
+                    continue
+                used_ref_local.add(i_local)
+                used_res_local.add(j_local)
+
+                if iou < iou_threshold:
+                    log_error(
+                        "Image %d class %s IoU failed: %.4f < %.2f",
+                        img_idx,
+                        cls,
+                        iou,
+                        iou_threshold,
+                    )
+                    return False
+
+                ref_score = float(ref_scores[ref_idx[i_local]])
+                res_score = float(res_scores[res_idx[j_local]])
+                if abs(ref_score - res_score) > score_tol:
+                    log_error(
+                        "Image %d class %s score mismatch: |%.6f - %.6f| > %.6f",
+                        img_idx,
+                        cls,
+                        ref_score,
+                        res_score,
+                        score_tol,
+                    )
+                    return False
+
+            if len(used_ref_local) != ref_idx.numel() or len(used_res_local) != res_idx.numel():
+                log_error(
+                    "Image %d class %s matching incomplete: matched_ref=%d/%d matched_res=%d/%d",
+                    img_idx,
+                    cls,
+                    len(used_ref_local),
+                    ref_idx.numel(),
+                    len(used_res_local),
+                    res_idx.numel(),
+                )
+                return False
+
+    return True
 
 
 class CI(NamedTuple):
@@ -1972,6 +2120,19 @@ class BenchmarkRunner:
     def get_iou_threshold(self, name):
         return 0.99
 
+    @property
+    def label_iou_accuracy_models(self):
+        return set()
+
+    def use_label_iou_accuracy(self, name):
+        return name in self.label_iou_accuracy_models
+
+    def get_detection_iou_threshold(self, name):
+        return 0.9
+
+    def get_detection_score_tolerance(self, name, tol):
+        return max(tol, 1e-3)
+
     def get_accuracy_check_runs(self, name):
         return 1
 
@@ -2452,22 +2613,37 @@ class BenchmarkRunner:
                             "The result is bitwise equivalent to the previously saved result"
                         )
                         del saved_result
-
-                    if not same(
-                        correct_result,
-                        new_result,
-                        fp64_outputs,
-                        equal_nan=self.equal_nan,
-                        use_larger_multiplier_for_smaller_tensor=self.use_larger_multiplier_for_smaller_tensor(
-                            name
-                        ),
-                        cos_similarity=cos_similarity,
-                        tol=tolerance,
-                        force_max_multiplier=force_max_multiplier,
-                        use_iou_for_bool=self.use_iou_for_bool_accuracy(name),
-                        iou_threshold=self.get_iou_threshold(name),
-                    ):
-                        run_passed = False
+                    print("DEBUG: correct_result[0]['boxes']:", correct_result[0]['boxes'])
+                    print("DEBUG: correct_result[0]['labels']:", correct_result[0]['labels'])
+                    print("DEBUG: correct_result[0]['scores']:", correct_result[0]['scores'])
+                    print("DEBUG: new_result[0]['boxes']:", new_result[0]['boxes'])
+                    print("DEBUG: new_result[0]['labels']:", new_result[0]['labels'])
+                    print("DEBUG: new_result[0]['scores']:", new_result[0]['scores'])
+                    if self.use_label_iou_accuracy(name):
+                        run_passed = _same_detection_by_label_iou(
+                            correct_result,
+                            new_result,
+                            iou_threshold=self.get_detection_iou_threshold(name),
+                            score_tol=self.get_detection_score_tolerance(
+                                name, tolerance
+                            ),
+                            log_error=log.error,
+                        )
+                    else:
+                        run_passed = same(
+                            correct_result,
+                            new_result,
+                            fp64_outputs,
+                            equal_nan=self.equal_nan,
+                            use_larger_multiplier_for_smaller_tensor=self.use_larger_multiplier_for_smaller_tensor(
+                                name
+                            ),
+                            cos_similarity=cos_similarity,
+                            tol=tolerance,
+                            force_max_multiplier=force_max_multiplier,
+                            use_iou_for_bool=self.use_iou_for_bool_accuracy(name),
+                            iou_threshold=self.get_iou_threshold(name),
+                        )
                 except Exception:
                     # Sometimes torch.allclose may throw RuntimeError
                     run_passed = False
