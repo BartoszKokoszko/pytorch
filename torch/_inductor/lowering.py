@@ -2023,9 +2023,27 @@ def cat(inputs, dim=0):
 
         # horizontal fuse in case all inputs will require a copy kernel anyway.
         # only horizontally fuse pointwise kernels
-        horizontal_fuse_cat = all(
-            should_lower_cat_input(inp) for inp in inputs
-        ) and not any(can_fuse_reduction(t) for t in inputs)
+        #
+        # Skip pointwise_cat when any input has multiple consumers, since
+        # inlining would cause duplicate computation. ConcatKernel's
+        # NonOwningLayout lets all consumers share one realized copy.
+        def any_input_has_multi_consumers() -> bool:
+            cat_node = V.current_node
+            if cat_node is None:
+                return False
+            fx_args = cat_node.args[0]  # aten.cat format: cat(input_list, dim)
+            if not isinstance(fx_args, (list, tuple)):
+                return False
+            return any(
+                hasattr(arg, "users") and len(arg.users) > 1
+                for arg in fx_args
+            )
+
+        horizontal_fuse_cat = (
+            all(should_lower_cat_input(inp) for inp in inputs)
+            and not any(can_fuse_reduction(t) for t in inputs)
+            and not any_input_has_multi_consumers()
+        )
         if fuse_pointwise_use or (horizontal_fuse_cat and not fusable_reduction):
             return pointwise_cat(inputs, dim)
 
@@ -4708,6 +4726,52 @@ def inplace_constant_pad_nd(
     return resized_x
 
 
+def _pad_as_cat(
+    x: TensorBox, padding: Sequence[int], fill_value: float
+) -> TensorBox | None:
+    """Rewrite right-pad as ConcatKernel for multi-consumer inputs (zero-copy)."""
+    sizes = x.get_size()
+    ndim = len(sizes)
+    pad_pairs = list(zip(padding[::2], padding[1::2]))
+
+    # Only support single-dimension right-pad
+    pad_dim = None
+    pad_amount = None
+    for i, (left, right) in enumerate(pad_pairs):
+        if left != 0:
+            return None
+        if right != 0:
+            if pad_dim is not None:
+                return None  # multi-dim pad
+            pad_dim = ndim - 1 - i  # padding format is reversed dim order
+            pad_amount = right
+
+    if pad_dim is None or pad_amount is None:
+        return None
+
+    # Only fire for multi-consumer inputs; single-consumer pads are
+    # already optimal with the default masked Pointwise lowering.
+    pad_node = V.current_node
+    if pad_node is None:
+        return None
+    input_node = pad_node.args[0]
+    if not (isinstance(input_node, torch.fx.Node) and len(input_node.users) > 1):
+        return None
+
+    # Build the fill tensor for the padding region
+    pad_shape = list(sizes)
+    pad_shape[pad_dim] = pad_amount
+    dtype = x.get_dtype()
+    device = x.get_device()
+    fill_value_typed = dtype_to_type(dtype)(fill_value)
+    pad_tensor = tensor_constructor(fill_value_typed)(
+        pad_shape, dtype=dtype, device=device
+    )
+
+    counters["inductor"]["pad_as_cat"] += 1
+    return TensorBox(ir.ConcatKernel.create([x, pad_tensor], pad_dim))
+
+
 @register_lowering(aten.constant_pad_nd, type_promotion_kind=None)
 def constant_pad_nd(x, padding, fill_value=0):
     assert (len(padding) % 2) == 0
@@ -4719,6 +4783,10 @@ def constant_pad_nd(x, padding, fill_value=0):
         if out:
             return out
             # fall through if can not inplace the padding
+
+    out = _pad_as_cat(x, padding, fill_value)
+    if out is not None:
+        return out
 
     sizes = x.get_size()
 
