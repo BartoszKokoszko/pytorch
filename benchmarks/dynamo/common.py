@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import weakref
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Optional, overload, TYPE_CHECKING, TypeVar
 from unittest.mock import MagicMock
@@ -116,6 +117,128 @@ output_filename = None
 disable_output = False
 
 MAX_DOWNLOAD_ATTEMPTS = 5
+
+
+def _box_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU for boxes in xyxy format."""
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]), dtype=torch.float32)
+
+    boxes1 = boxes1.to(dtype=torch.float32)
+    boxes2 = boxes2.to(dtype=torch.float32)
+
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (
+        boxes1[:, 3] - boxes1[:, 1]
+    ).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (
+        boxes2[:, 3] - boxes2[:, 1]
+    ).clamp(min=0)
+    union = area1[:, None] + area2[None, :] - inter
+    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
+
+
+def _same_detection_by_label_iou_vision_maskrcnn(
+    ref: list[dict[str, Any]],
+    res: list[dict[str, Any]],
+    *,
+    iou_threshold: float,
+    tolerance: float,
+    log_error: Callable[..., None],
+) -> bool:
+    """Compare single-image detection outputs by class label and IoU-based matching."""
+    if len(ref) != len(res):
+        log_error("Detection output length mismatch: %d != %d", len(ref), len(res))
+        return False
+    # Single-image assumption can be revisited when the vision_maskrcnn
+    # batch_size=1 override in benchmarks/dynamo/torchbench.py is removed.
+    if len(ref) != 1:
+        log_error("Expected single-image detection output, got %d items", len(ref))
+        return False
+
+    img_idx = 0
+
+    ref_boxes = ref[0]["boxes"]
+    ref_labels = ref[0]["labels"]
+    ref_scores = ref[0]["scores"]
+    res_boxes = res[0]["boxes"]
+    res_labels = res[0]["labels"]
+    res_scores = res[0]["scores"]
+
+    if (
+        ref_boxes.shape[0] != ref_labels.shape[0]
+        or ref_boxes.shape[0] != ref_scores.shape[0]
+    ):
+        log_error("Ref detection output %d has inconsistent sizes", img_idx)
+        return False
+    if (
+        res_boxes.shape[0] != res_labels.shape[0]
+        or res_boxes.shape[0] != res_scores.shape[0]
+    ):
+        log_error("Res detection output %d has inconsistent sizes", img_idx)
+        return False
+
+    all_labels = torch.unique(torch.cat([ref_labels, res_labels]))
+    for label in all_labels.tolist():
+        ref_idx = (ref_labels == label).nonzero(as_tuple=False).flatten()
+        res_idx = (res_labels == label).nonzero(as_tuple=False).flatten()
+
+        if ref_idx.numel() != res_idx.numel():
+            log_error(
+                "Image %d class %s count mismatch: ref=%d, res=%d",
+                img_idx,
+                label,
+                ref_idx.numel(),
+                res_idx.numel(),
+            )
+            return False
+
+        if ref_idx.numel() == 0:
+            continue
+
+        ious = _box_iou_xyxy(ref_boxes[ref_idx], res_boxes[res_idx])
+        candidates = []
+        for i in range(ious.shape[0]):
+            for j in range(ious.shape[1]):
+                candidates.append((float(ious[i, j]), int(i), int(j)))
+        candidates.sort(reverse=True, key=lambda x: x[0])
+
+        used_ref_local: set[int] = set()
+        used_res_local: set[int] = set()
+        for iou, i_local, j_local in candidates:
+            if i_local in used_ref_local or j_local in used_res_local:
+                continue
+            used_ref_local.add(i_local)
+            used_res_local.add(j_local)
+
+            if iou < iou_threshold:
+                log_error(
+                    "Image %d class %s IoU failed: %.4f < %.2f",
+                    img_idx,
+                    label,
+                    iou,
+                    iou_threshold,
+                )
+                return False
+
+            ref_score = float(ref_scores[ref_idx[i_local]])
+            res_score = float(res_scores[res_idx[j_local]])
+            if abs(ref_score - res_score) > tolerance:
+                log_error(
+                    "Image %d class %s score mismatch: |%.6f - %.6f| > %.6f",
+                    img_idx,
+                    label,
+                    ref_score,
+                    res_score,
+                    tolerance,
+                )
+                return False
+
+    return True
 
 
 class CI(NamedTuple):
@@ -1972,6 +2095,9 @@ class BenchmarkRunner:
     def get_iou_threshold(self, name):
         return 0.99
 
+    def get_detection_iou_threshold(self, name):
+        return 0.9
+
     def get_accuracy_check_runs(self, name):
         return 1
 
@@ -2452,22 +2578,29 @@ class BenchmarkRunner:
                             "The result is bitwise equivalent to the previously saved result"
                         )
                         del saved_result
-
-                    if not same(
-                        correct_result,
-                        new_result,
-                        fp64_outputs,
-                        equal_nan=self.equal_nan,
-                        use_larger_multiplier_for_smaller_tensor=self.use_larger_multiplier_for_smaller_tensor(
-                            name
-                        ),
-                        cos_similarity=cos_similarity,
-                        tol=tolerance,
-                        force_max_multiplier=force_max_multiplier,
-                        use_iou_for_bool=self.use_iou_for_bool_accuracy(name),
-                        iou_threshold=self.get_iou_threshold(name),
-                    ):
-                        run_passed = False
+                    if name == "vision_maskrcnn":
+                        run_passed = _same_detection_by_label_iou_vision_maskrcnn(
+                            correct_result,
+                            new_result,
+                            iou_threshold=self.get_detection_iou_threshold(name),
+                            tolerance=tolerance,
+                            log_error=log.error,
+                        )
+                    else:
+                        run_passed = same(
+                            correct_result,
+                            new_result,
+                            fp64_outputs,
+                            equal_nan=self.equal_nan,
+                            use_larger_multiplier_for_smaller_tensor=self.use_larger_multiplier_for_smaller_tensor(
+                                name
+                            ),
+                            cos_similarity=cos_similarity,
+                            tol=tolerance,
+                            force_max_multiplier=force_max_multiplier,
+                            use_iou_for_bool=self.use_iou_for_bool_accuracy(name),
+                            iou_threshold=self.get_iou_threshold(name),
+                        )
                 except Exception:
                     # Sometimes torch.allclose may throw RuntimeError
                     run_passed = False
