@@ -790,6 +790,41 @@ def linalg_replicate_strategy(op_schema: OpSchema) -> OpStrategy:
     return OpStrategy(output_strategies)
 
 
+SINGLE_OUTPUT_POOL_OPS = [
+    aten._adaptive_avg_pool3d.default,
+    aten.avg_pool2d.default,
+    aten.avg_pool3d.default,
+]
+
+DUAL_OUTPUT_POOL_OPS = [
+    aten.adaptive_max_pool2d.default,
+    aten.adaptive_max_pool3d.default,
+    aten.fractional_max_pool2d.default,
+    aten.fractional_max_pool3d.default,
+    aten.max_pool2d_with_indices.default,
+    aten.max_pool3d_with_indices.default,
+]
+
+
+@register_op_strategy(
+    SINGLE_OUTPUT_POOL_OPS + DUAL_OUTPUT_POOL_OPS,
+    schema_info=RuntimeSchemaInfo(1),
+)
+def pooling_strategy(op_schema: OpSchema) -> OpStrategy:
+    input_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mesh = input_strategy.mesh
+    num_outputs = 2 if op_schema.op in DUAL_OUTPUT_POOL_OPS else 1
+    num_inputs = len(op_schema.args_strategy) + len(op_schema.kwargs_strategy)
+    n = num_outputs + num_inputs
+    single_mesh_dim_strategies: list[PlacementList] = [
+        [Replicate()] * n,
+        [Shard(0)] * n,
+    ]
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=num_outputs
+    )
+
+
 @register_op_strategy(
     [aten._log_softmax.default, aten._softmax.default, aten._safe_softmax.default],
     schema_info=RuntimeSchemaInfo(1),
