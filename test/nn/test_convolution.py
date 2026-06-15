@@ -4074,6 +4074,48 @@ class TestConvolutionNNDeviceType(NNTestCase):
             torch.ops.aten.slow_conv_dilated3d, input, weight, bias, kwargs
         )
 
+    @onlyNativeDeviceTypes
+    @dtypes(torch.float)
+    def test_xpu_conv3d_strided_input_views(self, device, dtype):
+        if self.device_type != "xpu":
+            self.skipTest("XPU-specific oneDNN stride descriptor coverage")
+
+        def run_case(x):
+            weight = torch.randn(6, 4, 3, 3, 2, device=device, dtype=dtype)
+            kwargs = dict(stride=(1, 1, 1), padding=(1, 1, 0), dilation=(1, 1, 1))
+
+            x = x.detach().requires_grad_(True)
+            weight = weight.detach().requires_grad_(True)
+            out = F.conv3d(x, weight, **kwargs)
+
+            grad = torch.randn_like(out)
+            grad_x, grad_weight = torch.autograd.grad(out, (x, weight), grad)
+
+            x_ref = x.detach().contiguous().requires_grad_(True)
+            weight_ref = weight.detach().contiguous().requires_grad_(True)
+            out_ref = F.conv3d(x_ref, weight_ref, **kwargs)
+            grad_x_ref, grad_weight_ref = torch.autograd.grad(
+                out_ref, (x_ref, weight_ref), grad
+            )
+
+            self.assertEqual(out, out_ref)
+            self.assertEqual(grad_x, grad_x_ref)
+            self.assertEqual(grad_weight, grad_weight_ref)
+
+        base = torch.randn(1, 4, 6, 5, 4, device=device, dtype=dtype)
+        run_case(base.expand(2, -1, -1, -1, -1))
+
+        ndhwc = torch.randn(2, 6, 5, 4, 4, device=device, dtype=dtype)
+        run_case(ndhwc.permute(0, 4, 1, 2, 3))
+
+        sliced = torch.randn(2, 4, 6, 10, 4, device=device, dtype=dtype)[:, :, :, ::2, :]
+        run_case(sliced)
+
+        overlap_base = torch.randn(2, 4, 6, 5, 8, device=device, dtype=dtype)
+        overlapped = overlap_base.as_strided((2, 4, 6, 5, 4), (960, 240, 40, 1, 1))
+        self.assertNotEqual(torch._debug_has_internal_overlap(overlapped), 0)
+        run_case(overlapped)
+
 
 class TestConvolutionNNCUDA(NNTestCase):
     """CUDA/cuDNN-specific convolution tests."""
