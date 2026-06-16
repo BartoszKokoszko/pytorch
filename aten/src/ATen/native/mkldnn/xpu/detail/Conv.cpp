@@ -47,6 +47,7 @@ conv_get_md(
     const at::Tensor& dst,
     int64_t groups,
     bool is_channels_last) {
+  std::cout << "### DEBUG: conv_get_md ###" << std::endl;
   (void)is_channels_last;
   // create memory desc from the src/weight/dst tensors
   dnnl::memory::desc src_usr_md, weight_usr_md, dst_usr_md;
@@ -57,10 +58,16 @@ conv_get_md(
   auto src_data_t = get_onednn_dtype_include_double(src);
   src_usr_md = dnnl::memory::desc(src_size, src_data_t, src_strides);
 
+  std::cout << "### DEBUG: conv_get_md ###: src_size: " << src_size << std::endl;
+  std::cout << "### DEBUG: conv_get_md ###: src_strides: " << src_strides << std::endl;
+
   auto dst_size = dst.sizes().vec();
   auto dst_strides = dst.strides().vec();
   auto dst_data_t = get_onednn_dtype_include_double(dst);
   dst_usr_md = dnnl::memory::desc(dst_size, dst_data_t, dst_strides);
+
+  std::cout << "### DEBUG: conv_get_md ###: dst_size: " << dst_size << std::endl;
+  std::cout << "### DEBUG: conv_get_md ###: dst_strides: " << dst_strides << std::endl;
 
   auto ic = src.size(1);
   auto oc = dst.size(1);
@@ -83,6 +90,8 @@ conv_get_md(
         groups);
 
     auto weight_strides = weight.strides().vec();
+    std::cout << "### DEBUG: conv_get_md ###: weight_size: " << weight_size << std::endl;
+    std::cout << "### DEBUG: conv_get_md ###: weight_strides: " << weight_strides << std::endl;
     dnnl::memory::dims grouped_weight_strides;
     grouped_weight_strides.reserve(
         static_cast<size_t>(weight.ndimension()) + 1);
@@ -112,6 +121,7 @@ sycl::event convolution(
     int64_t groups,
     Attr& attr,
     const std::vector<sycl::event>& deps) {
+  std::cout << "### DEBUG: convolution ###" << std::endl;
   auto& engine = GpuEngineManager::Instance().get_engine();
   auto& stream = GpuStreamManager::Instance().get_stream();
 
@@ -212,6 +222,7 @@ sycl::event convolution_backward_weights(
     IntArrayRef dilation,
     int64_t groups,
     const std::vector<sycl::event>& deps) {
+  std::cout << "### DEBUG: convolution_backward_weights ###" << std::endl;
   auto& engine = GpuEngineManager::Instance().get_engine();
   auto& stream = GpuStreamManager::Instance().get_stream();
 
@@ -319,6 +330,8 @@ sycl::event convolution_backward_data(
     int64_t groups,
     bool bias_defined,
     const std::vector<sycl::event>& deps) {
+  std::cout << "### DEBUG: convolution_backward_data ###" << std::endl;
+
   auto& engine = GpuEngineManager::Instance().get_engine();
   auto& stream = GpuStreamManager::Instance().get_stream();
 

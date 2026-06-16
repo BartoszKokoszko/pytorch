@@ -269,6 +269,7 @@ Tensor _convolution_out(
     int64_t groups_,
     Attr attr,
     IntArrayRef pad_nd = IntArrayRef({})) {
+  std::cout << "### DEBUG: _convolution_out ###"<< std::endl;
   CheckedFrom c = "xpu_convolution";
   TensorArg input_t{input_r, "input", 1}, weight_t{weight_r, "weight", 2};
   checkAllSameType(c, {input_t, weight_t});
@@ -426,6 +427,7 @@ Tensor _convolution(
     IntArrayRef output_padding_,
     int64_t groups_,
     Attr attr) {
+  std::cout << "### DEBUG: _convolution ###"<< std::endl;
   Tensor output_r;
   return _convolution_out(
       output_r,
@@ -451,6 +453,7 @@ Tensor convolution_overrideable(
     bool transposed_,
     IntArrayRef output_padding_,
     int64_t groups_) {
+  std::cout << "### DEBUG: convolution_overrideable ###"<< std::endl;
   c10::MaybeOwned<Tensor> bias_r_maybe_owned =
       at::borrow_from_optional_tensor(bias_r_opt);
   const Tensor& bias_r = *bias_r_maybe_owned;
@@ -479,6 +482,7 @@ std::tuple<Tensor, Tensor, Tensor> convolution_backward_overrideable(
     IntArrayRef output_padding,
     int64_t groups,
     std::array<bool, 3> output_mask) {
+  std::cout << "### DEBUG: convolution_backward_overrideable ###"<< std::endl;
   CheckedFrom c = "xpu_convolution_backward";
   c10::DeviceGuard device_guard(grad_output.device());
   auto ndim = input.ndimension();
@@ -634,6 +638,7 @@ Tensor convolution_pointwise(
     std::string_view attr,
     torch::List<std::optional<at::Scalar>> scalars,
     std::optional<std::string_view> algorithm) {
+  std::cout << "### DEBUG: convolution_pointwise ###"<< std::endl;
   c10::DeviceGuard device_guard(input_t.device());
   Attr att;
   att = construct_unary_attr(att, attr, scalars, algorithm);
@@ -666,6 +671,7 @@ Tensor convolution_pointwise_binary(
     std::optional<std::string_view> unary_attr,
     torch::List<std::optional<at::Scalar>> unary_scalars,
     std::optional<std::string_view> unary_algorithm) {
+  std::cout << "### DEBUG: convolution_pointwise_binary ###"<< std::endl;
   c10::DeviceGuard device_guard(input_t.device());
   Tensor output;
   Tensor bias = bias_opt.has_value() ? bias_opt.value() : at::Tensor();
@@ -708,6 +714,7 @@ Tensor& convolution_pointwise_binary_(
     std::optional<std::string_view> unary_attr,
     torch::List<std::optional<at::Scalar>> unary_scalars,
     std::optional<std::string_view> unary_algorithm) {
+  std::cout << "### DEBUG: convolution_pointwise_binary_ ###"<< std::endl;
   c10::DeviceGuard device_guard(input_t.device());
   Tensor bias = bias_opt.has_value() ? bias_opt.value() : at::Tensor();
   // Step1: Construct binary attr

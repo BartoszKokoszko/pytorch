@@ -4077,6 +4077,7 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float)
     def test_xpu_conv3d_strided_input_views(self, device, dtype):
+        print("\n\n### DEBUG: test_xpu_conv3d_strided_input_views ###")
         if self.device_type != "xpu":
             self.skipTest("XPU-specific oneDNN stride descriptor coverage")
 
@@ -4102,16 +4103,26 @@ class TestConvolutionNNDeviceType(NNTestCase):
             self.assertEqual(grad_x, grad_x_ref)
             self.assertEqual(grad_weight, grad_weight_ref)
 
-        base = torch.randn(1, 4, 6, 5, 4, device=device, dtype=dtype)
-        run_case(base.expand(2, -1, -1, -1, -1))
+        # 1) Broadcasted batch dim + size-1 spatial dim with non-canonical stride.
+        # Mirrors the review concern around broadcasting/size-1 stride semantics.
+        bcast_base = torch.randn(1, 4, 6, 1, 4, device=device, dtype=dtype)
+        bcast_view = bcast_base.as_strided((2, 4, 6, 1, 4), (0, 24, 4, 57, 1))
+        print(f"\n\n### DEBUG: test_xpu_conv3d_strided_input_views 1) broadcast {bcast_view.shape},{bcast_view.stride()} ###")
+        run_case(bcast_view)
 
+        # 2) Permuted NDHWC -> NCDHW view.
+        print("\n\n### DEBUG: test_xpu_conv3d_strided_input_views 2) permuted ###")
         ndhwc = torch.randn(2, 6, 5, 4, 4, device=device, dtype=dtype)
         run_case(ndhwc.permute(0, 4, 1, 2, 3))
 
+        # 3) Sliced strided view.
+        print("\n\n### DEBUG: test_xpu_conv3d_strided_input_views 3) sliced ###")
         sliced = torch.randn(2, 4, 6, 10, 4, device=device, dtype=dtype)[:, :, :, ::2, :]
         run_case(sliced)
 
-        overlap_base = torch.randn(2, 4, 6, 5, 8, device=device, dtype=dtype)
+        # 4) Overlapped view.
+        print("\n\n### DEBUG: test_xpu_conv3d_strided_input_views 4) overlapped ###")
+        overlap_base = torch.randn(2, 4, 6, 10, 8, device=device, dtype=dtype)
         overlapped = overlap_base.as_strided((2, 4, 6, 5, 4), (960, 240, 40, 1, 1))
         self.assertNotEqual(torch._debug_has_internal_overlap(overlapped), 0)
         run_case(overlapped)
