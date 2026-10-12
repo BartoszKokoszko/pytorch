@@ -505,49 +505,39 @@ static PyObject* unwrapDeadWrappers(PyObject* _unused, PyObject* args) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(PyTuple_Check(args), "expected a tuple of arguments");
   const auto num_args = PyTuple_GET_SIZE(args);
-  // Lazily allocate only after finding a dead wrapper; otherwise return args.
-  THPObjectPtr result;
+  // NB: unlike the original ad17677ba8d implementation, we always allocate a
+  // fresh result tuple and Py_INCREF every element (even when nothing is
+  // unwrapped), matching the pre-ad17677ba8d pure-Python semantics. Returning
+  // the input `args` tuple unchanged (identity-preserving shortcut) was
+  // suspected to cause a Windows-specific eager latency regression (issue
+  // 4923); this keeps the fast C loop but drops that shortcut.
+  PyObject* result = PyTuple_New(num_args);
+  if (!result) {
+    return nullptr;
+  }
 
   for (Py_ssize_t idx = 0; idx < num_args; idx++) {
     auto* item = PyTuple_GET_ITEM(args, idx);
+    PyObject* out_item = item;
+
     if (THPVariable_Check(item)) {
       const auto& tensor = THPVariable_Unpack(item);
-      if (!isDeadTensorWrapper(tensor)) {
-        if (result) {
-          Py_INCREF(item);
-          PyTuple_SET_ITEM(result.get(), idx, item);
-        }
-        continue;
-      }
-
-      if (!result) {
-        result = PyTuple_New(num_args);
-        if (!result) {
+      if (isDeadTensorWrapper(tensor)) {
+        out_item = THPVariable_Wrap(unwrapIfDead(tensor));
+        if (out_item == nullptr) {
+          Py_DECREF(result);
           return nullptr;
         }
-        for (Py_ssize_t copy_idx = 0; copy_idx < idx; copy_idx++) {
-          auto* copied_item = PyTuple_GET_ITEM(args, copy_idx);
-          Py_INCREF(copied_item);
-          PyTuple_SET_ITEM(result.get(), copy_idx, copied_item);
-        }
+        PyTuple_SET_ITEM(result, idx, out_item);
+        continue;
       }
-
-      auto* unwrapped = THPVariable_Wrap(unwrapIfDead(tensor));
-      if (unwrapped == nullptr) {
-        return nullptr;
-      }
-      PyTuple_SET_ITEM(result.get(), idx, unwrapped);
-    } else if (result) {
-      Py_INCREF(item);
-      PyTuple_SET_ITEM(result.get(), idx, item);
     }
+
+    Py_INCREF(out_item);
+    PyTuple_SET_ITEM(result, idx, out_item);
   }
 
-  if (!result) {
-    Py_INCREF(args);
-    return args;
-  }
-  return result.release();
+  return result;
   END_HANDLE_TH_ERRORS
 }
 
