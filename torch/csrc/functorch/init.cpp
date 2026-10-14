@@ -9,6 +9,7 @@
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/functorch/init.h>
 #include <torch/csrc/utils/object_ptr.h>
+#include <c10/util/env.h>
 #include <torch/csrc/utils/python_raii.h>
 #include <torch/python.h>
 
@@ -317,11 +318,31 @@ static int64_t _jvp_decrement_nesting() {
   return layer.layerId();
 }
 
+// Pre-#189577 (ad17677ba8d14e6e05289447682b28c215ad8038) took batch_size by
+// value and std::move()'d it into initAndPushDynamicLayer; #189577 switched
+// to a const-ref without the move (an extra SymInt copy either way, since
+// initAndPushDynamicLayer takes it by value). Functionally equivalent, but
+// kept toggleable via PYTORCH_DISABLE_VMAP_INCREMENT_NESTING_FAST so it can
+// be bisected/compared against the pre-#189577 behavior without a rebuild.
+static bool use_fast_vmap_increment_nesting() {
+  static const bool use_fast =
+      c10::utils::check_env("PYTORCH_DISABLE_VMAP_INCREMENT_NESTING_FAST") !=
+      true;
+  return use_fast;
+}
+
 static int64_t _vmap_increment_nesting(
     const c10::SymInt& batch_size,
     const std::string& randomness) {
+  if (use_fast_vmap_increment_nesting()) {
+    return initAndPushDynamicLayer(
+        TransformType::Vmap, batch_size, get_randomness_enum(randomness));
+  }
+  c10::SymInt batch_size_copy = batch_size;
   return initAndPushDynamicLayer(
-      TransformType::Vmap, batch_size, get_randomness_enum(randomness));
+      TransformType::Vmap,
+      std::move(batch_size_copy),
+      get_randomness_enum(randomness));
 }
 
 static int64_t _vmap_decrement_nesting() {
@@ -501,7 +522,9 @@ static std::tuple<Tensor, std::optional<int64_t>> unwrapBatched(
   return std::make_tuple(tensor, std::nullopt);
 }
 
-static PyObject* unwrapDeadWrappers(PyObject* _unused, PyObject* args) {
+// Fast path introduced by #189577. Lazily allocates a new tuple only after
+// finding a dead wrapper; otherwise returns the input args tuple unchanged.
+static PyObject* unwrapDeadWrappersFast(PyObject* _unused, PyObject* args) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(PyTuple_Check(args), "expected a tuple of arguments");
   const auto num_args = PyTuple_GET_SIZE(args);
@@ -549,6 +572,55 @@ static PyObject* unwrapDeadWrappers(PyObject* _unused, PyObject* args) {
   }
   return result.release();
   END_HANDLE_TH_ERRORS
+}
+
+// Pre-#189577 behavior: always allocates a new tuple and always rewraps
+// every tensor argument via unwrap_if_dead, regardless of liveness. Kept
+// around so PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST can opt back into it
+// at runtime without a rebuild, for bisecting/comparing against #189577.
+static PyObject* unwrapDeadWrappersSlow(PyObject* _unused, PyObject* args) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(PyTuple_Check(args), "expected a tuple of arguments");
+  const auto num_args = PyTuple_GET_SIZE(args);
+  THPObjectPtr result(PyTuple_New(num_args));
+  if (!result) {
+    return nullptr;
+  }
+
+  for (Py_ssize_t idx = 0; idx < num_args; idx++) {
+    auto* item = PyTuple_GET_ITEM(args, idx);
+    if (THPVariable_Check(item)) {
+      const auto& tensor = THPVariable_Unpack(item);
+      auto* unwrapped = THPVariable_Wrap(unwrapIfDead(tensor));
+      if (unwrapped == nullptr) {
+        return nullptr;
+      }
+      PyTuple_SET_ITEM(result.get(), idx, unwrapped);
+    } else {
+      Py_INCREF(item);
+      PyTuple_SET_ITEM(result.get(), idx, item);
+    }
+  }
+
+  return result.release();
+  END_HANDLE_TH_ERRORS
+}
+
+// Set PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST=1 to opt out of the #189577
+// (ad17677ba8d14e6e05289447682b28c215ad8038) fast path at runtime, without
+// rebuilding, for bisecting/comparing against the pre-#189577 behavior.
+static bool use_fast_unwrap_dead_wrappers() {
+  static const bool use_fast =
+      c10::utils::check_env("PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST") !=
+      true;
+  return use_fast;
+}
+
+static PyObject* unwrapDeadWrappers(PyObject* _unused, PyObject* args) {
+  if (use_fast_unwrap_dead_wrappers()) {
+    return unwrapDeadWrappersFast(_unused, args);
+  }
+  return unwrapDeadWrappersSlow(_unused, args);
 }
 
 // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
