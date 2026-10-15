@@ -3046,17 +3046,16 @@ torch_non_c_binding_in_graph_functions = dict.fromkeys(
 )
 
 
-# Set PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST=1 to make Dynamo classify
-# torch._functorch.utils.unwrap_dead_wrappers the way it did before #189577
-# (ad17677ba8d14e6e05289447682b28c215ad8038), matching the runtime toggle in
-# torch/csrc/functorch/init.cpp, for bisecting/comparing without a rebuild.
+# Keep the helper traceable even when the slow fallback is selected.
+# The slow Python implementation is still a valid in-graph helper,
+# not a function that must be skipped by Dynamo.
 if os.environ.get("PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST") == "1":
-    torch_c_binding_in_graph_functions.pop(
+    torch_non_c_binding_in_graph_functions.pop(
         "torch._functorch.utils.unwrap_dead_wrappers", None
     )
-    torch_non_c_binding_in_graph_functions[
+    torch_c_binding_in_graph_functions[
         "torch._functorch.utils.unwrap_dead_wrappers"
-    ] = None
+    ] = TorchInGraphFunctionVariable
 
 
 torch_name_rule_map = [
