@@ -1048,6 +1048,7 @@ def latency_experiment_summary(suite_name, args, model, timings, **kwargs):
 
 
 def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
+    print("DEBUG: speedup_experiment()")
     """
     Measure speedups over eager.
 
@@ -1170,6 +1171,7 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
             p.export_chrome_trace(name)
 
     median = np.median(timings, axis=0)
+    print(f"DEBUG: speedup_experiment(): {median=}")
     speedup = median[0] / median[1]
     if args.dump_raw_metrics:
         np.save(
@@ -2764,6 +2766,7 @@ class BenchmarkRunner:
     def run_performance_test_non_alternate(
         self, name, model, example_inputs, optimize_ctx, experiment, tag=None
     ):
+        print("DEBUG: run_performance_test_non_alternate()")
         "Run performance test in non-alternately."
         if experiment.func is not latency_experiment:
             raise AssertionError(
@@ -2848,6 +2851,8 @@ class BenchmarkRunner:
                 **experiment_kwargs,
             )
 
+            print(f"DEBUG baseline_timings={baseline_timings}")
+
             # reset dynamo
             torch._dynamo.reset()
 
@@ -2891,6 +2896,10 @@ class BenchmarkRunner:
                 dynamo_cache_lookup_latency = events[0].self_cpu_time_total
 
             compilation_time = dynamo_latency - eager_latency
+            print(f"DEBUG: {dynamo_latency=}")
+            print(f"DEBUG: {eager_latency=}")
+            print(f"DEBUG: {compilation_time=}")
+
             compression_ratio = (
                 eager_peak_mem / dynamo_peak_mem if dynamo_peak_mem else 0.0
             )
@@ -2922,6 +2931,7 @@ class BenchmarkRunner:
                 mark="expected",
                 **experiment_kwargs,
             )
+            print(f"DEBUG backend_timings={backend_timings}")
             timings = np.stack((baseline_timings, backend_timings), axis=1)
             result_summary = latency_experiment_summary(
                 self.suite_name, self.args, model, timings, **experiment_kwargs
@@ -2939,6 +2949,7 @@ class BenchmarkRunner:
         tag=None,
         batch_size=None,
     ):
+        print("DEBUG: run_performance_test()")
         niters = 5
         if getattr(self, "hf_llm", False):
             # If we're benchmarking an llm, we want to use the generate function
@@ -3082,6 +3093,9 @@ class BenchmarkRunner:
                 dynamo_cache_lookup_latency = events[0].self_cpu_time_total
 
             compilation_time = dynamo_latency - eager_latency
+            print(f"DEBUG: {dynamo_latency=}")
+            print(f"DEBUG: {eager_latency=}")
+            print(f"DEBUG: {compilation_time=}")
             compression_ratio = (
                 eager_peak_mem / dynamo_peak_mem if dynamo_peak_mem else 0.0
             )

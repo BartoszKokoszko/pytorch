@@ -24,7 +24,7 @@ __all__ = [
 def _unwrap_dead_wrappers_slow(args: tuple[Any, ...]) -> tuple[Any, ...]:
     # Pre-#189577 (ad17677ba8d14e6e05289447682b28c215ad8038) pure-Python
     # implementation. NB: doesn't use tree_map_only for performance reasons.
-    if os.environ.get("PYTORCH_DISABLE_UNWRAP_DEAD_WRAPPERS_FAST") == "1":
+    if os.environ.get("PYTORCH_DEBUG_UNWRAP_DEAD_WRAPPERS") == "1":
         print("debug: python: _unwrap_dead_wrappers_slow()")
     result = tuple(
         unwrap_if_dead(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
